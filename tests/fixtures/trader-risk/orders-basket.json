@@ -1,0 +1,73 @@
+{
+  "created_by": "trader-budget",
+  "status": "proposed",
+  "paper": true,
+  "note": "five plain whole-share buys with no stop (a basket); prices from Yahoo, 2026-10-29",
+  "orders": [
+    {
+      "symbol": "RELIANCE",
+      "exchange": "NSE",
+      "side": "buy",
+      "quantity": 75,
+      "product": "MIS",
+      "order_type": "MARKET",
+      "validity": "DAY",
+      "client_tag": "basket-RELIANCE",
+      "plan": {
+        "entry": 1167.4
+      }
+    },
+    {
+      "symbol": "TCS",
+      "exchange": "NSE",
+      "side": "buy",
+      "quantity": 35,
+      "product": "MIS",
+      "order_type": "MARKET",
+      "validity": "DAY",
+      "client_tag": "basket-TCS",
+      "plan": {
+        "entry": 2478.0
+      }
+    },
+    {
+      "symbol": "INFY",
+      "exchange": "NSE",
+      "side": "buy",
+      "quantity": 70,
+      "product": "MIS",
+      "order_type": "MARKET",
+      "validity": "DAY",
+      "client_tag": "basket-INFY",
+      "plan": {
+        "entry": 1146.5
+      }
+    },
+    {
+      "symbol": "HDFCBANK",
+      "exchange": "NSE",
+      "side": "buy",
+      "quantity": 120,
+      "product": "MIS",
+      "order_type": "MARKET",
+      "validity": "DAY",
+      "client_tag": "basket-HDFCBANK",
+      "plan": {
+        "entry": 683.3
+      }
+    },
+    {
+      "symbol": "M&M",
+      "exchange": "NSE",
+      "side": "buy",
+      "quantity": 30,
+      "product": "MIS",
+      "order_type": "MARKET",
+      "validity": "DAY",
+      "client_tag": "basket-M&M",
+      "plan": {
+        "entry": 2890.0
+      }
+    }
+  ]
+}

@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
-"""News monitor for trader-news. Standard library only.
+"""News monitor for trader-news (NSE). Standard library only.
 
-Watches headlines and SEC filings for the stocks you watch or hold and
-prints only what is new since the last check, newest first, with how far each
-stock has moved today and a flag on anything that touches your tickers.
+Watches headlines for the NSE stocks you watch or hold and prints only what
+is new since the last check, newest first, with how far each stock has moved
+today and a flag on anything that touches your symbols.
 
-    python3 news.py                                  # watchlist + plan + portfolio tickers
-    python3 news.py --tickers TSLA NVDA AMD
-    python3 news.py --tickers TSLA --all --hours 72  # everything in the last 3 days, seen or not
-    python3 news.py --no-sec                         # headlines only
-    python3 news.py --no-moves                       # skip the price line per ticker
+    python3 news.py                                  # watchlist + plan + portfolio symbols
+    python3 news.py --tickers RELIANCE TCS INFY
+    python3 news.py --tickers RELIANCE --all --hours 72   # everything in the last 3 days, seen or not
+    python3 news.py --no-feeds                       # skip the market-wide feeds
+    python3 news.py --no-moves                       # skip the price line per symbol
 
-Your tickers, when --tickers is not given: every hit in trader/watchlist.json
-(trader-scanner), the symbol in trader/plan.json (trader-exit) and the
-positions in trader/portfolio.json.
+Your symbols (bare NSE symbols: RELIANCE, M&M, BAJAJ-AUTO), when --tickers is
+not given: every hit in trader/watchlist.json (trader-scanner), the symbol in
+trader/plan.json (trader-exit) and the positions in trader/portfolio.json.
+A typed .NS suffix is accepted and dropped. Company names for the news query
+come from trader/universe.txt (SYMBOL|Name lines, written by trader-scanner);
+without one the symbol itself is searched.
 
-Sources, one request each per ticker:
-  - Yahoo Finance headline RSS:
-    https://feeds.finance.yahoo.com/rss/2.0/headline?s=<TICKER>&region=US&lang=en-US
-  - SEC EDGAR filings Atom feed for the company (8-K by default: earnings,
-    executive changes, deals, restatements):
-    https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=<CIK>&type=8-K&count=10&output=atom
-    SEC needs a User-Agent with your name and email (sec_user_agent in
-    trader/config.json or SEC_USER_AGENT). Without one the SEC part is skipped
-    and the tool says so; headlines still run.
-
+Sources (checked from India, no key, no login):
+  - Google News RSS, one request per symbol, searching the company name or the symbol:
+    https://news.google.com/rss/search?q="<Company>" OR "<SYMBOL>" when:48h&hl=en-IN&gl=IN&ceid=IN:en
+  - Market-wide RSS feeds from Moneycontrol, Mint and Business Standard, one
+    request each per run, kept only where a headline names one of your
+    companies or symbols.
   - The move: Yahoo Finance's chart endpoint (unofficial, can lag), the last
-    price against yesterday's close:
-    https://query2.finance.yahoo.com/v8/finance/chart/<TICKER>?range=1d&interval=5m
+    price against the previous close:
+    https://query2.finance.yahoo.com/v8/finance/chart/<SYMBOL>.NS?range=1d&interval=5m
+  Yahoo's headline RSS and search-news endpoints return no NSE stories, so they
+  are not used. Nothing from NSE or BSE is read: their announcement APIs block
+  plain requests, so exchange filings (results, board meetings, shareholding)
+  are NOT covered here. News feeds lag and miss things.
 
-Times print in New York time (ET). State: trader/state/news.json remembers
-what you have seen (30 days), so an item shows once. Offline: --offline DIR
-reads yahoo-<TICKER>.xml, chart-<TICKER>.json, sec-<FORM>-<CIK>.xml and
-company_tickers.json from DIR. The tests use it.
+Times print in IST (UTC+5:30, no daylight saving). State: trader/state/news.json
+remembers what you have seen (30 days), so an item shows once. Offline:
+--offline DIR reads google-<SYMBOL>.xml, chart-<SYMBOL>.json and
+feed-moneycontrol.xml / feed-mint.xml / feed-business-standard.xml from DIR.
+The tests use it.
 
 Headlines are leads, not facts: open the story before acting, and treat
 nothing here as advice.
@@ -43,48 +47,49 @@ import datetime as _dt
 import email.utils
 import gzip
 import hashlib
+import html
 import json
+import math
 import os
 import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-YAHOO = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%s&region=US&lang=en-US"
+GOOGLE = "https://news.google.com/rss/search?q=%s&hl=en-IN&gl=IN&ceid=IN:en"
 CHART = "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=5m"
-SEC_FEED = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=%s&type=%s"
-            "&dateb=&owner=include&count=%d&output=atom")
-TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-PLACEHOLDER = "you@example.com"
-BROWSER_UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/Jakeschincariol/day-trader-skill)"
+FEEDS = [  # market-wide RSS: (file name offline, label, url)
+    ("feed-moneycontrol.xml", "Moneycontrol", "https://www.moneycontrol.com/rss/business.xml"),
+    ("feed-mint.xml", "Mint", "https://www.livemint.com/rss/markets"),
+    ("feed-business-standard.xml", "Business Std", "https://www.business-standard.com/rss/markets-106.rss"),
+]
+BROWSER_UA = "Mozilla/5.0"
 KEEP_DAYS = 30
-MOVE_PCT = 3.0  # a stock this far from yesterday's close is flagged as moving
+PER_SYMBOL = 25   # newest stories kept per symbol from its Google News search
+MOVE_PCT = 3.0    # a stock this far from the previous close is flagged as moving
+IST = _dt.timedelta(hours=5, minutes=30)  # fixed: India has no daylight saving
 
-ITEMS_8K = {
-    "1.01": "material agreement", "1.02": "agreement ended", "1.03": "bankruptcy",
-    "1.05": "cybersecurity incident", "2.01": "acquisition or sale of assets",
-    "2.02": "earnings results", "2.03": "new debt", "2.04": "debt acceleration",
-    "2.05": "restructuring costs", "2.06": "impairment", "3.01": "delisting notice",
-    "3.02": "unregistered share sale", "3.03": "shareholder rights change",
-    "4.01": "auditor change", "4.02": "past financials no longer reliable",
-    "5.01": "change in control", "5.02": "director or officer change",
-    "5.03": "bylaws or fiscal year change", "5.07": "shareholder vote results",
-    "7.01": "Regulation FD disclosure", "8.01": "other events", "9.01": "exhibits",
-}
-IMPORTANT_ITEMS = {"1.03", "1.05", "2.02", "2.04", "2.06", "3.01", "4.02", "5.01", "5.02"}
 KEYWORDS = [
-    ("earnings", r"\bearnings\b|\bresults\b|\bEPS\b|\bguidance\b|\bforecast\b"),
-    ("analyst", r"\bupgrade[sd]?\b|\bdowngrade[sd]?\b|price target|\boutperform\b|\bunderperform\b"),
-    ("legal", r"\blawsuit\b|\bsued\b|\bprobe\b|\binvestigation\b|\bSEC charges\b|\bantitrust\b|\bjudge\b|\bcourt\b"),
-    ("deal", r"\bacqui(?:re|res|red|sition)\b|\bmerger\b|\bbuyout\b|\btakeover\b|\bdeal\b"),
-    ("capital", r"\bdividend\b|\bbuyback\b|\brepurchase\b|\bstock split\b|\boffering\b"),
-    ("people", r"\bCEO\b|\bCFO\b|\bresign|\bsteps down\b|\bappoint"),
-    ("risk", r"\brecall\b|\bbankrupt|\bdefault\b|\bdelist|\bhack|\bbreach\b|\boutage\b"),
-    ("halt", r"\bhalt(?:s|ed)?\b|\btrading (?:pause|suspen)"),
-    ("regulatory", r"\bFDA\b|\bapproval\b|\bapproves\b|\bclinical\b|\bFTC\b|\bDOJ\b"),
-    ("macro", r"\bFed\b|\bFOMC\b|\bCPI\b|\binflation\b|\bjobs report\b|\bpayrolls\b|\btariffs?\b|\bfutures\b"),
+    ("results", r"\bresults?\b|\bearnings\b|\bQ[1-4]\s?FY\d+|\bnet profit\b|\bnet loss\b|\bPAT\b|\bEBITDA\b|\bguidance\b"),
+    ("board", r"\bboard meeting\b|\bboard (?:meets|approves|clears|to consider)\b"),
+    ("dividend", r"\bdividend\b|\bbonus (?:issue|shares)\b|\brecord date\b|\bex-date\b|\bstock split\b"),
+    ("order", r"\border (?:win|book|worth|inflow)\b|\b(?:bags?|bagged|wins?|won|secures?|secured)\b.{0,25}\b(?:orders?|contracts?)\b|\bletter of (?:intent|award)\b|\bLoI\b|\bLoA\b"),
+    ("sebi", r"\bSEBI\b"),
+    ("rbi", r"\bRBI\b|\bReserve Bank\b|\brepo rate\b|\bmonetary policy\b"),
+    ("block deal", r"\bblock deals?\b|\bbulk deals?\b"),
+    ("promoter", r"\bpromoters?\b|\bpledg(?:e|ed|es)\b|\binsider\b|\bstake (?:sale|buy|hike|cut)\b|\bsells? stake\b|\bbuys? stake\b"),
+    ("analyst", r"\bupgrade[sd]?\b|\bdowngrade[sd]?\b|target price|\btarget\b.{0,20}\bRs\b|\bbuy rating\b|\bsell rating\b|\binitiates coverage\b|\bbrokerage\b|\boverweight\b|\bunderweight\b|\boutperform\b|\bunderperform\b"),
+    ("deal", r"\bacqui(?:re|res|red|sition)\b|\bmerger\b|\bdemerger\b|\bamalgamation\b|\bbuyout\b|\btakeover\b|\bjoint venture\b|\bJV\b|\bdeal\b"),
+    ("capital", r"\bbuyback\b|\bQIP\b|\brights issue\b|\bpreferential (?:issue|allotment)\b|\bIPO\b|\bOFS\b|\boffer for sale\b|\bfund[- ]?rais|\braises? Rs\b"),
+    ("legal", r"\blawsuit\b|\bsued\b|\bprobe\b|\binvestigation\b|\bcourt\b|\bNCLT\b|\bNCLAT\b|\bED raid|\bfraud\b|\bpenalty\b|\bshow[- ]cause\b"),
+    ("people", r"\bCEO\b|\bCFO\b|\bMD\b|\bchairman\b|\bresign|\bsteps down\b|\bappoint"),
+    ("risk", r"\brecall\b|\bbankrupt|\binsolvency\b|\bdefault\b|\bdelist|\bhack|\bbreach\b|\boutage\b"),
+    ("halt", r"\bhalt(?:s|ed)?\b|\btrading (?:pause|suspen)|\bupper circuit\b|\blower circuit\b|\bcircuit\b|\bprice band\b|\bF&O ban\b|\bASM\b|\bGSM\b"),
+    ("regulatory", r"\bUSFDA\b|\bFDA\b|\bapproval\b|\bapproves\b|\bCCI\b|\bDGCA\b|\bTRAI\b|\bIRDAI\b|\btax notice\b|\bGST\b"),
+    ("macro", r"\bSensex\b|\bNifty\b|\bFed\b|\bFOMC\b|\bCPI\b|\binflation\b|\bGDP\b|\bcrude\b|\btariffs?\b|\bFII\b|\bFPI\b|\bGIFT Nifty\b"),
 ]
 
 
@@ -94,26 +99,20 @@ class NewsError(Exception):
 
 # ---------------------------------------------------------------- time
 
-def _nth_sunday(year, month, n):
-    d = _dt.date(year, month, 1)
-    d += _dt.timedelta(days=(6 - d.weekday()) % 7)
-    return d + _dt.timedelta(weeks=n - 1)
-
-
-def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
-    y = utc.year
-    start = _dt.datetime.combine(_nth_sunday(y, 3, 2), _dt.time(7, 0))   # 2:00 EST
-    end = _dt.datetime.combine(_nth_sunday(y, 11, 1), _dt.time(6, 0))    # 2:00 EDT
-    naive = utc.replace(tzinfo=None)
-    return -4 if start <= naive < end else -5
-
-
-def to_eastern(utc):
-    """Aware or naive UTC -> naive New York wall-clock time."""
+def to_local(utc):
+    """Aware or naive UTC -> naive IST wall-clock time (a constant +5:30)."""
     if utc.tzinfo is not None:
         utc = utc.astimezone(_dt.timezone.utc)
-    return utc.replace(tzinfo=None) + _dt.timedelta(hours=eastern_offset(utc))
+    return utc.replace(tzinfo=None) + IST
+
+
+def local_to_utc(local):
+    """Naive IST wall-clock time -> aware UTC."""
+    return (local - IST).replace(tzinfo=_dt.timezone.utc)
+
+
+def ts_to_local(ts):
+    return to_local(_dt.datetime.fromtimestamp(ts, _dt.timezone.utc))
 
 
 # ---------------------------------------------------------------- inputs
@@ -125,60 +124,70 @@ def load_json(path):
     return None
 
 
+def bare(sym):
+    """The symbol as the rest of the pack carries it: RELIANCE, not RELIANCE.NS."""
+    sym = sym.strip().upper()
+    return sym[:-3] if sym.endswith(".NS") else sym
+
+
+def yahoo_symbol(sym):
+    """RELIANCE -> RELIANCE.NS, URL-quoted (M&M -> M%26M.NS)."""
+    return urllib.parse.quote(bare(sym) + ".NS", safe=".-")
+
+
+def load_universe(path="trader/universe.txt"):
+    """{SYMBOL: Name} from the scanner's SYMBOL|Name lines; {} when there is no file."""
+    out = {}
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                sym, sep, name = line.strip().partition("|")
+                if sep and sym.strip():
+                    out[bare(sym)] = name.strip()
+    return out
+
+
 def watch_from_files(portfolio="trader/portfolio.json", watchlist="trader/watchlist.json",
-                     plan="trader/plan.json"):
-    """{ticker: name or None}: the scanner's hits, the planned trade and your holdings."""
+                     plan="trader/plan.json", universe="trader/universe.txt"):
+    """{symbol: name or None}: the scanner's hits, the planned trade and your holdings."""
     out = {}
     wl = load_json(watchlist) or {}
     for h in wl.get("hits", []):
         sym = h.get("symbol") or h.get("ticker")
         if sym:
-            out[sym.upper()] = h.get("name")
+            out[bare(sym)] = h.get("name")
     pl = load_json(plan) or {}
     if pl.get("symbol"):
-        out.setdefault(pl["symbol"].upper(), pl.get("name"))
+        out.setdefault(bare(pl["symbol"]), pl.get("name"))
     pf = load_json(portfolio) or {}
     for p in pf.get("positions", []):
         sym = p.get("ticker") or p.get("symbol")
         if sym:
-            out[sym.upper()] = p.get("name") or out.get(sym.upper())
-    return out
-
-
-def sec_user_agent(cli=None, config="trader/config.json"):
-    ua = (cli or os.environ.get("SEC_USER_AGENT") or "").strip()
-    if not ua:
-        cfg = load_json(config) or {}
-        ua = str(cfg.get("sec_user_agent") or "").strip()
-    if not ua or "@" not in ua or PLACEHOLDER in ua:
-        return None
-    return ua
+            out[bare(sym)] = p.get("name") or out.get(bare(sym))
+    names = load_universe(universe)
+    return {s: (n or names.get(s)) for s, n in out.items()}
 
 
 # ---------------------------------------------------------------- fetching
 
 class Fetcher(object):
-    def __init__(self, sec_ua=None, offline=None, pause=0.15):
-        self.sec_ua = sec_ua
+    def __init__(self, offline=None, pause=0.15):
         self.offline = offline
         self.pause = pause
         self._last = 0.0
 
-    def get(self, url, name, sec=False):
+    def get(self, url, name):
         if self.offline:
             path = os.path.join(self.offline, name)
             if not os.path.isfile(path):
                 raise NewsError("offline: no file %s" % path)
             with open(path, "rb") as fh:
                 return fh.read()
-        if sec and not self.sec_ua:
-            raise NewsError("no SEC User-Agent set")
         gap = time.time() - self._last
         if gap < self.pause:
             time.sleep(self.pause - gap)
         self._last = time.time()
-        headers = {"User-Agent": self.sec_ua if sec else BROWSER_UA, "Accept-Encoding": "gzip"}
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept-Encoding": "gzip"})
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
@@ -191,19 +200,20 @@ class Fetcher(object):
             raise NewsError("could not reach %s: %s" % (url, exc.reason))
 
 
-def yahoo_symbol(ticker):
-    return ticker.upper().replace(".", "-")
+def short_name(name):
+    """'Reliance Industries Limited' -> 'Reliance Industries' (for the search and for matching)."""
+    name = re.sub(r"\([^)]*\)", " ", name or "")
+    name = re.sub(r"[\s,]+(?:limited|ltd\.?)\s*$", "", name.strip(), flags=re.I)
+    return " ".join(name.split())
 
 
-def cik_map(fetcher, state):
-    """ticker -> 10-digit CIK, from SEC's company_tickers.json (cached in state)."""
-    cached = state.setdefault("ciks", {})
-    if cached:
-        return cached
-    data = json.loads(fetcher.get(TICKERS_URL, "company_tickers.json", sec=True).decode("utf-8"))
-    for v in data.values():
-        cached.setdefault(v["ticker"].upper().replace("-", "."), str(v["cik_str"]).zfill(10))
-    return cached
+def google_url(sym, name, hours=48):
+    """The news search for one symbol: the quoted company name or the symbol, newest window only."""
+    short = short_name(name)
+    q = '"%s" OR "%s"' % (short, bare(sym)) if len(short) >= 3 else '"%s" NSE' % bare(sym)
+    hours = max(1, int(math.ceil(hours)))
+    q += " when:%dh" % hours if hours <= 72 else " when:%dd" % int(math.ceil(hours / 24.0))
+    return GOOGLE % urllib.parse.quote_plus(q)
 
 
 # ---------------------------------------------------------------- parsing
@@ -219,8 +229,13 @@ def _text(el, name):
     return ""
 
 
+def _plain(markup):
+    """Feed descriptions carry HTML: keep only the words."""
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", html.unescape(markup or ""))).split())
+
+
 def parse_time(value):
-    """RFC 822 (RSS) or ISO 8601 (Atom) -> aware UTC datetime, or None."""
+    """RFC 822 (RSS) or ISO 8601 -> aware UTC datetime, or None."""
     value = (value or "").strip()
     if not value:
         return None
@@ -238,69 +253,61 @@ def parse_time(value):
     return d.astimezone(_dt.timezone.utc)
 
 
-def parse_rss(data, ticker):
-    """Yahoo headline RSS -> items."""
+def _items(data, what):
     try:
         root = ET.fromstring(data)
-    except ET.ParseError as exc:
-        raise NewsError("RSS for %s is not valid XML: %s" % (ticker, exc))
+    except ET.ParseError:
+        # real feeds ship a bare "&" now and then: escape those and try once more
+        fixed = re.sub(rb"&(?!(?:[A-Za-z]+|#\d+|#x[0-9A-Fa-f]+);)", b"&amp;", data)
+        try:
+            root = ET.fromstring(fixed)
+        except ET.ParseError as exc:
+            raise NewsError("%s is not valid XML: %s" % (what, exc))
+    return list(root.iter("item"))
+
+
+def parse_google(data, sym):
+    """Google News RSS -> items. The publisher is the ' - Name' tail of each title."""
     out = []
-    for it in root.iter("item"):
+    for it in _items(data, "Google News for %s" % sym):
         title = _text(it, "title")
-        link = _text(it, "link")
-        guid = _text(it, "guid") or link
-        out.append({"id": "rss:" + guid, "source": "Yahoo Finance", "kind": "headline",
-                    "ticker": ticker, "title": title, "summary": _text(it, "description"),
-                    "link": link, "time": parse_time(_text(it, "pubDate"))})
+        publisher = _text(it, "source")
+        if publisher and title.endswith(" - " + publisher):
+            title = title[:-len(publisher) - 3]
+        elif " - " in title:
+            title, publisher = title.rsplit(" - ", 1)
+        guid = _text(it, "guid") or _text(it, "link")
+        out.append({"id": "gn:" + guid, "source": publisher or "Google News", "kind": "headline",
+                    "ticker": sym, "title": title.strip(), "summary": "",
+                    "link": _text(it, "link"), "time": parse_time(_text(it, "pubDate"))})
     return out
 
 
-def parse_sec_atom(data, ticker):
-    """EDGAR company filings Atom -> items."""
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError as exc:
-        raise NewsError("SEC feed for %s is not valid XML: %s" % (ticker, exc))
-    company = ""
-    for el in root.iter():
-        if _local(el.tag) == "conformed-name":
-            company = (el.text or "").strip()
-            break
+def parse_feed(data, label):
+    """A market-wide RSS feed (Moneycontrol, Mint, Business Standard) -> items with no symbol yet."""
     out = []
-    for entry in root.iter():
-        if _local(entry.tag) != "entry":
-            continue
-        form = _text(entry, "filing-type")
-        acc = _text(entry, "accession-number")
-        items = re.findall(r"\d+\.\d+", _text(entry, "items-desc"))
-        labels = [ITEMS_8K.get(i, "item " + i) for i in items if i != "9.01"]
-        link = ""
-        for c in entry.iter():
-            if _local(c.tag) == "link":
-                link = c.get("href", "")
-        title = "%s filed a %s" % (company or ticker, form)
-        if labels:
-            title += ": " + ", ".join(labels)
-        out.append({"id": "sec:" + acc, "source": "SEC EDGAR", "kind": "filing", "form": form,
-                    "ticker": ticker, "title": title, "summary": _text(entry, "form-name"),
-                    "items": items, "important": bool(set(items) & IMPORTANT_ITEMS),
-                    "link": link, "time": parse_time(_text(entry, "updated"))})
+    for it in _items(data, "%s feed" % label):
+        link = _text(it, "link")
+        out.append({"id": "rss:" + (_text(it, "guid") or link), "source": label, "kind": "headline",
+                    "ticker": "", "title": _plain(_text(it, "title")),
+                    "summary": _plain(_text(it, "description")), "link": link,
+                    "time": parse_time(_text(it, "pubDate"))})
     return out
 
 
-def parse_chart(data, ticker):
+def parse_chart(data, sym):
     """Yahoo chart JSON -> {"ticker", "price", "prev_close", "pct", "time"} or raise."""
     try:
         doc = json.loads(data.decode("utf-8") if isinstance(data, bytes) else data)
         meta = doc["chart"]["result"][0]["meta"]
     except (ValueError, KeyError, IndexError, TypeError):
-        raise NewsError("chart for %s is not usable" % ticker)
+        raise NewsError("chart for %s is not usable" % sym)
     price = meta.get("regularMarketPrice")
     prev = meta.get("chartPreviousClose") or meta.get("previousClose")
     if not price or not prev:
-        raise NewsError("chart for %s has no price" % ticker)
+        raise NewsError("chart for %s has no price" % sym)
     when = meta.get("regularMarketTime")
-    return {"ticker": ticker, "price": round(float(price), 2), "prev_close": round(float(prev), 2),
+    return {"ticker": sym, "price": round(float(price), 2), "prev_close": round(float(prev), 2),
             "pct": round((float(price) / float(prev) - 1) * 100, 2),
             "time": _dt.datetime.fromtimestamp(when, _dt.timezone.utc) if when else None}
 
@@ -325,29 +332,38 @@ def collect_moves(fetcher, watch, errors=None):
 
 
 def mention_patterns(watch):
+    """Per symbol: (company-name regex or None, symbol regex). The name matches any case,
+    the symbol only as written in capitals (TCS, not 'tcs'), and only if 3+ characters."""
     pats = {}
     for t, name in watch.items():
-        alts = [r"\(%s\)" % re.escape(t), r"\$%s\b" % re.escape(t),
-                r"\b(?:NYSE|NASDAQ|Nasdaq)\s*:\s*%s\b" % re.escape(t)]
-        if name and len(name) >= 4:
-            alts.append(r"\b%s\b" % re.escape(name).replace(r"\ ", r"[\s-]"))
-        pats[t] = re.compile("|".join(alts))
+        short = short_name(name)
+        by_name = None
+        if len(short) >= 4:
+            by_name = re.compile(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(short).replace(r"\ ", r"[\s-]"),
+                                 re.I)
+        by_sym = re.compile(r"(?<![A-Za-z0-9&-])%s(?![A-Za-z0-9&'\u2019-])" % re.escape(t)) if len(t) >= 3 else None
+        pats[t] = (by_name, by_sym)
     return pats
 
 
+def names_it(it, pats):
+    """Does the headline (or its summary) name this company or symbol?"""
+    by_name, by_sym = pats
+    hay = "%s %s" % (it["title"], it.get("summary") or "")
+    return bool((by_name and by_name.search(hay)) or (by_sym and by_sym.search(hay)))
+
+
 def tag(items, watch):
-    """Which of your tickers each item touches, and why it matters."""
+    """Which of your symbols each item touches, and why it matters."""
     pats = mention_patterns(watch)
     for it in items:
         hay = "%s %s" % (it["title"], it.get("summary") or "")
         touches = {it["ticker"]} if it["ticker"] in watch else set()
-        for t, rx in pats.items():
-            if rx.search(hay):
+        for t, p in pats.items():
+            if names_it(it, p):
                 touches.add(t)
         it["touches"] = sorted(touches)
         it["tags"] = [label for label, rx in KEYWORDS if re.search(rx, hay, re.I)]
-        if it["kind"] == "filing" and "2.02" in it.get("items", []) and "earnings" not in it["tags"]:
-            it["tags"].insert(0, "earnings")
     return items
 
 
@@ -378,33 +394,27 @@ def fingerprint(it):
 
 # ---------------------------------------------------------------- the check
 
-def collect(fetcher, watch, state, sec=True, forms=("8-K",), count=10, errors=None):
+def collect(fetcher, watch, feeds=True, hours=48, errors=None):
     errors = [] if errors is None else errors
     items = []
+    pats = mention_patterns(watch)
     for t in sorted(watch):
         try:
-            items += parse_rss(fetcher.get(YAHOO % yahoo_symbol(t), "yahoo-%s.xml" % t), t)
+            got = parse_google(fetcher.get(google_url(t, watch[t], hours), "google-%s.xml" % t), t)
+            got = [i for i in got if names_it(i, pats[t])]  # Google pads a search with loose matches
+            got.sort(key=lambda i: i["time"] or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc), reverse=True)
+            items += got[:PER_SYMBOL]
         except NewsError as exc:
             errors.append("headlines for %s: %s" % (t, exc))
-    if sec:
-        try:
-            ciks = cik_map(fetcher, state)
-        except NewsError as exc:
-            errors.append("SEC ticker list: %s" % exc)
-            ciks = {}
-        for t in sorted(watch):
-            cik = ciks.get(t)
-            if not cik:
-                if ciks:
-                    errors.append("no SEC CIK for %s" % t)
+    if feeds:
+        for name, label, url in FEEDS:
+            try:
+                got = parse_feed(fetcher.get(url, name), label)
+            except NewsError as exc:
+                if not (fetcher.offline and "no file" in str(exc)):
+                    errors.append("%s feed: %s" % (label, exc))
                 continue
-            for form in forms:
-                try:
-                    data = fetcher.get(SEC_FEED % (cik, form, count),
-                                       "sec-%s-%s.xml" % (form, cik), sec=True)
-                    items += parse_sec_atom(data, t)
-                except NewsError as exc:
-                    errors.append("SEC %s for %s: %s" % (form, t, exc))
+            items += [i for i in tag(got, watch) if i["touches"]]  # only stories that name your stocks
     return items
 
 
@@ -439,8 +449,8 @@ def render_moves(moves, move_pct=MOVE_PCT):
     out = []
     for m in moves:
         flag = "MOVING" if abs(m["pct"]) >= move_pct else ""
-        when = (" at %s ET" % to_eastern(m["time"]).strftime("%H:%M")) if m.get("time") else ""
-        out.append("%-6s %s %+.2f%% vs yesterday's close %s%s  %s" % (
+        when = (" at %s IST" % to_local(m["time"]).strftime("%H:%M")) if m.get("time") else ""
+        out.append("%-12s ₹%s %+.2f%% vs previous close ₹%s%s  %s" % (
             m["ticker"], "{:,.2f}".format(m["price"]), m["pct"], "{:,.2f}".format(m["prev_close"]),
             when, flag))
     return out
@@ -453,10 +463,9 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
     if not items:
         out.append("Nothing new.")
     for it in items:
-        when = to_eastern(it["time"]).strftime("%Y-%m-%d %H:%M ET") if it["time"] else "time unknown"
-        mark = "!" if it.get("important") else " "
-        who = ",".join(it["touches"]) or it["ticker"]
-        out.append("%s %s  %-11s %-13s %s" % (mark, when, who, it["source"], it["title"]))
+        when = to_local(it["time"]).strftime("%Y-%m-%d %H:%M IST") if it["time"] else "time unknown"
+        who = ",".join(it["touches"]) or it["ticker"] or "market"
+        out.append("  %s  %-11s %-13s %s" % (when, who, it["source"][:13], it["title"]))
         extra = []
         if it["tags"]:
             extra.append("tags: " + ", ".join(it["tags"]))
@@ -465,7 +474,8 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
     for e in errors:
         out.append("note: %s" % e)
     out.append("Checked %s. Headlines are leads, not facts; open the story before acting. "
-               "Not financial advice." % to_eastern(now).strftime("%Y-%m-%d %H:%M ET"))
+               "News feeds lag and miss things; no NSE or BSE filings are read. "
+               "Not financial advice." % to_local(now).strftime("%Y-%m-%d %H:%M IST"))
     return "\n".join(out) + "\n"
 
 
@@ -480,31 +490,31 @@ def _json_ready(items):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--tickers", nargs="*", help="default: watchlist + plan + portfolio")
+    ap.add_argument("--tickers", nargs="*", help="NSE symbols; default: watchlist + plan + portfolio")
     ap.add_argument("--portfolio", default="trader/portfolio.json")
     ap.add_argument("--watchlist", default="trader/watchlist.json")
     ap.add_argument("--plan", default="trader/plan.json")
+    ap.add_argument("--universe", default="trader/universe.txt", help="SYMBOL|Name lines, for company names")
     ap.add_argument("--state", default="trader/state/news.json")
     ap.add_argument("--hours", type=float, default=48, help="ignore items older than this")
     ap.add_argument("--all", action="store_true", help="show seen items too")
-    ap.add_argument("--forms", default="8-K", help="SEC forms to watch, comma separated")
-    ap.add_argument("--no-sec", action="store_true", help="headlines only")
-    ap.add_argument("--no-moves", action="store_true", help="skip the price line per ticker")
+    ap.add_argument("--no-feeds", action="store_true", help="skip the market-wide Moneycontrol/Mint/Business Standard feeds")
+    ap.add_argument("--no-moves", action="store_true", help="skip the price line per symbol")
     ap.add_argument("--move-pct", type=float, default=MOVE_PCT, help="flag a move this big (percent)")
-    ap.add_argument("--user-agent", help="SEC User-Agent: \"Your Name you@example.com\"")
-    ap.add_argument("--config", default="trader/config.json")
     ap.add_argument("--offline", metavar="DIR")
     ap.add_argument("--now", help="ISO time, for reproducible runs")
     ap.add_argument("--dry-run", action="store_true", help="do not update the state file")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
+    known = watch_from_files(args.portfolio, args.watchlist, args.plan, args.universe)
     if args.tickers:
-        watch = {t.upper(): None for t in args.tickers}
-        known = watch_from_files(args.portfolio, args.watchlist, args.plan)
+        watch = {bare(t): None for t in args.tickers}
         watch.update({t: known[t] for t in watch if known.get(t)})
+        names = load_universe(args.universe)
+        watch.update({t: names[t] for t in watch if not watch[t] and names.get(t)})
     else:
-        watch = watch_from_files(args.portfolio, args.watchlist, args.plan)
+        watch = known
     if not watch:
         print("news: no tickers. Pass --tickers, or run /trader-scanner first (it writes "
               "trader/watchlist.json).", file=sys.stderr)
@@ -512,15 +522,8 @@ def main(argv=None):
     now = parse_time(args.now) if args.now else _dt.datetime.now(_dt.timezone.utc)
     state = load_json(args.state) or {}
     errors = []
-    ua = sec_user_agent(args.user_agent, args.config)
-    sec = not args.no_sec
-    if sec and not ua and not args.offline:
-        errors.append("SEC filings skipped: set sec_user_agent in trader/config.json or "
-                      "SEC_USER_AGENT (\"Your Name you@example.com\") to include them")
-        sec = False
-    fetcher = Fetcher(ua, offline=args.offline)
-    forms = [f.strip().upper() for f in args.forms.split(",") if f.strip()]
-    items = collect(fetcher, watch, state, sec=sec, forms=forms, errors=errors)
+    fetcher = Fetcher(offline=args.offline)
+    items = collect(fetcher, watch, feeds=not args.no_feeds, hours=args.hours, errors=errors)
     items = dedupe(tag(items, watch))
     shown = select(items, state, now, hours=args.hours, show_all=args.all)
     moves = [] if args.no_moves else collect_moves(fetcher, watch, errors)

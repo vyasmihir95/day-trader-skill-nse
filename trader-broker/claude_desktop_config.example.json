@@ -1,13 +1,11 @@
 {
   "mcpServers": {
-    "alpaca": {
-      "command": "uvx",
-      "args": ["alpaca-mcp-server"],
+    "my-broker": {
+      "command": "REPLACE_WITH_THE_COMMAND_YOUR_BROKER_DOCUMENTS",
+      "args": ["REPLACE_WITH_THE_ARGUMENTS_YOUR_BROKER_DOCUMENTS"],
       "env": {
-        "ALPACA_API_KEY": "YOUR_PAPER_API_KEY_TYPED_HERE_NEVER_IN_CHAT",
-        "ALPACA_SECRET_KEY": "YOUR_PAPER_SECRET_KEY_TYPED_HERE_NEVER_IN_CHAT",
-        "ALPACA_PAPER_TRADE": "true",
-        "ALPACA_TOOLSETS": "account,trading,stock-data"
+        "BROKER_API_KEY": "TYPE_YOUR_KEY_HERE_IN_THIS_FILE_NEVER_IN_CHAT",
+        "BROKER_API_SECRET": "TYPE_YOUR_SECRET_HERE_IN_THIS_FILE_NEVER_IN_CHAT"
       }
     }
   }

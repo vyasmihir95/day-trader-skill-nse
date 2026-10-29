@@ -5,15 +5,14 @@ import unittest
 
 from _load import ROOT
 
-# v2, the day-trading pack: the eleven folders the reel's repo card shows
+# the India-only day-trading pack: nine skills (the US-only Pelosi tracker and Earnings Analyst are gone)
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
-          "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
-          "trader-pelosi"]
-ABOUT = ("11 Claude skills for day trading: scan thousands of charts, track breaking news, time every "
-         "entry and exit, and replay every outcome before you risk a dollar.")
+          "trader-risk", "trader-budget", "trader-broker", "trader-alerts"]
+ABOUT = ("9 Claude skills for day trading the Indian market (NSE): scan thousands of charts, track the news, "
+         "time every entry and exit, and replay every outcome before you risk a rupee.")
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
-              "trader-pelosi", "trader-risk", "trader-broker", "trader-alerts"]
+              "trader-risk", "trader-broker", "trader-alerts"]
 V1_ONLY = ["trader-copycat", "trader-screener", "trader-tax", "trader-rebalance"]
 
 
@@ -33,12 +32,12 @@ def every_text_file():
 
 
 class Repo(unittest.TestCase):
-    def test_eleven_skill_folders_at_the_root(self):
+    def test_nine_skill_folders_at_the_root(self):
         found = sorted(d for d in os.listdir(ROOT)
                        if os.path.isfile(os.path.join(ROOT, d, "SKILL.md")))
         self.assertEqual(found, sorted(SKILLS))
 
-    def test_root_matches_the_reel(self):
+    def test_root_holds_only_the_skills(self):
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git"))
         self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
 
@@ -68,18 +67,16 @@ class Repo(unittest.TestCase):
         self.assertEqual(market["name"], "day-trader-skill")
         self.assertEqual(market["plugins"][0]["name"], "day-trader-skill")
 
-    def test_readme_carries_the_reel_copy(self):
+    def test_readme_is_the_india_readme(self):
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
             readme = " ".join(fh.read().split())
-        self.assertTrue(readme.startswith("# The Day Trader skill"))
-        for line in (ABOUT,
-                     "https://github.com/Jakeschincariol/day-trader-skill install skill",
-                     "/plugin marketplace add Jakeschincariol/day-trader-skill",
-                     "/plugin install day-trader-skill@day-trader-skill",
-                     "## Fine print"):
+        self.assertTrue(readme.startswith("# The Day Trader skill, for the Indian market"))
+        for line in (ABOUT, "cp -r trader-* ~/.claude/skills/", "## Fine print", "not verified", "nseindia.com"):
             self.assertIn(line, readme)
         for s in SKILLS:
             self.assertIn("/" + s, readme, s)
+        for gone in ("trader-pelosi", "trader-analyst", "Alpaca", "Nasdaq", "NYSE", "SEC EDGAR", "TSLA", "--market"):
+            self.assertNotIn(gone, readme.replace("US-only skills", ""), gone)
 
     def test_no_em_dashes_and_no_personal_email(self):
         for path in every_text_file():
@@ -121,7 +118,7 @@ class Repo(unittest.TestCase):
     def test_day_trading_limits_ship_in_the_example_config(self):
         with open(os.path.join(ROOT, "trader-budget", "config.example.json")) as fh:
             cfg = json.load(fh)
-        for k in ("max_loss_per_trade_usd", "max_daily_loss_usd", "max_trades_per_day",
+        for k in ("max_loss_per_trade_inr", "max_daily_loss_inr", "max_trades_per_day",
                   "min_reward_risk", "require_stop", "no_entries_after", "flat_by"):
             self.assertIn(k, cfg, k)
         self.assertIs(cfg["require_stop"], True)

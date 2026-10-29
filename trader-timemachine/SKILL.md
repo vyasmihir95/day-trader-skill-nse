@@ -1,19 +1,19 @@
 ---
 name: trader-timemachine
 description: >-
-  Time Machine. Replays every possible outcome of a trade before you risk a
-  dollar: 10,000 simulated sessions plus every past time the setup fired.
-  Takes the plan from trader-exit (entry, stop, target), rebuilds the rest of
-  the day 10,000 times from the stock's own 5-minute bars over the last 60
-  days, and re-runs the same rule on every past session. Prints the odds of
-  target first, stop first, or neither by the close, where the price sits at
-  the close, the average R, the history, and one honest verdict, then hands
-  off to /trader-budget. Use when the user says "run the time machine",
-  "replay this trade", "what are the odds", "simulate this trade", "monte
-  carlo", "backtest this setup", "how often does this hit the target", "is
-  this a coin flip", or after /trader-exit writes a plan, before
-  /trader-budget.
-argument-hint: "[path to plan.json, or TICKER]"
+  Time Machine for NSE stocks. Replays every possible outcome of a trade
+  before you risk a rupee: 10,000 simulated sessions plus every past time the
+  setup fired. Takes the plan from trader-exit (entry, stop, target), rebuilds
+  the rest of the day 10,000 times from the stock's own 5-minute bars (Yahoo
+  SYMBOL.NS, the last 60 days, 75 bars a day from 09:15 to 15:30 IST), and
+  re-runs the same rule on every past session. Prints the odds of target
+  first, stop first, or neither by the close, where the price sits at the
+  close, the average R, the history, and one honest verdict, then hands off
+  to /trader-budget. Use when the user says "run the time machine", "replay
+  this trade", "what are the odds", "simulate this trade", "monte carlo",
+  "backtest this setup", "how often does this hit the target", "is this a coin
+  flip", or after /trader-exit writes a plan, before /trader-budget.
+argument-hint: "[path to plan.json, or SYMBOL]"
 ---
 
 # trader-timemachine
@@ -27,59 +27,74 @@ rule on every past session. It is a simulation built from the stock's own
 recent bars, not a prediction. Day trading loses most people money, and a
 good-looking replay does not change that.
 
+It works on NSE equities (RELIANCE, TCS, INFY, HDFCBANK, M&M ...). Tickers
+are the plain NSE symbol; Yahoo gets `SYMBOL.NS`. Prices are rupees (₹), times
+are IST (UTC+5:30), and the session is 09:15 to 15:30, which is 75 five-minute
+bars. Brokerage, STT, GST and stamp duty are not modelled: the replay is about
+price moves.
+
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run                    # trader/plan.json, 10,000 replays, seed 19
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --write            # also save trader/timemachine.json
-python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --until 15:55      # end each replay at your flat-by time
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --until 15:15      # end each replay at your flat-by time
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --json
-python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol TSLA --date 2026-10-19 \
-    --entry 364.18 --stop 358.32 --target 370.04 --entry-time "10:15 AM"
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol RELIANCE --date 2026-10-14 \
+    --entry 1170.70 --stop 1166.00 --target 1180.10 --entry-time "9:45 AM"
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
 ```
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
-`--now "2026-10-19 10:15"` (New York time) to pin the clock.
+`--now "2026-10-14 09:45"` (IST) to pin the clock, `--config FILE` (for
+`market_holidays`).
 
 ## What it reads and writes
 
 | file | what |
 | --- | --- |
 | `trader/plan.json` | the plan from trader-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range |
-| Yahoo chart API | one request: 60 days of 5-minute bars (`range=60d&interval=5m`), free and unofficial, can lag |
+| Yahoo chart API | one request: 60 days of 5-minute bars (`SYMBOL.NS`, `range=60d&interval=5m`), free and unofficial, can lag |
+| `trader/config.json` | only `market_holidays` (extra closed days) |
 | `trader/timemachine.json` | with `--write`: `{plan, mc, history}` plus the verdict. `mc` holds the odds, percentiles, the fan-chart bands, 160 sample paths and a 24-bin histogram of the close |
 
 ## How it works
 
-1. **The pool.** It keeps only FULL sessions before the plan's date: all 78
-   five-minute bars, 9:30 to 4:00 New York time. Half days, gaps and today
-   are left out. Every bar becomes four ratios to the bar before it:
-   open, high, low and close over the previous close.
+1. **The pool.** It keeps only FULL sessions before the plan's date: all 75
+   five-minute bars, 09:15 to 15:30 IST. The bar count comes from the
+   session, so there is nothing to hard-code. Short days, gaps and today are
+   left out. Every bar becomes four ratios to the bar before it: open, high,
+   low and close over the previous close.
+   **A known gap in the free data.** Yahoo's NSE 5-minute feed very often has
+   no bar for the last minutes of the day (in the RELIANCE data every one of
+   the 60 days lacks the 15:20 bar). A session that is complete except for
+   bars among its last three slots (15:15 to 15:25) still counts: each missing
+   bar is taken as unchanged from the bar before, and the report says how many
+   sessions needed that. A gap anywhere else leaves the session out. The last
+   few bars of the replay are therefore a little calmer than a real close.
 2. **One replay.** Start at the entry price. For each bar left in the day,
    pick a past bar from the same time of day (plus or minus 2 bars) at
    random, and scale it to the current price. Bar by bar, it checks the stop
    first, then the target. A bar that touches both counts as the stop.
 3. **10,000 replays** give four odds. Target first. Stop first. Neither,
-   which means the trade was still open at `--until` (default 4:00 PM, the
-   close, or 1:00 PM on an NYSE early-close day). Green, which means target
-   first or above the entry at `--until`.
-   R is +1 at a 1R target, -1 at the stop, and otherwise the distance from
-   the entry at `--until` divided by the risk. A gap through the stop still
-   counts as -1R here. A real fill can be worse.
+   which means the trade was still open at `--until` (default 3:30 PM, the
+   close; NSE has no early closes, so add `--until 15:15` to stop at the
+   usual flat-by time). Green, which means target first or above the entry at
+   `--until`. R is +1 at a 1R target, -1 at the stop, and otherwise the
+   distance from the entry at `--until` divided by the risk. A gap through
+   the stop still counts as -1R here. A real fill can be worse.
 4. **The history.** The plan's own rule (the same opening range, stop rule
    and target R) runs again on every one of those past sessions. That is
-   what really happened, not a simulation.
+   what really happened, not a simulation. Stops round down to NSE's 0.05
+   tick (away from the entry); entries and targets to the nearest tick.
 5. **The verdict** is one line from the numbers. It looks only at the
    replays that hit one side, and asks how often the target came first. A
    bigger target needs to win less often to break even: 1 in (1 + R). That
    is 50 % at 1R, 33 % at 2R, 25 % at 3R. Less than 5 points from break-even:
    "Close to a coin flip" at 1R, "Close to break-even" at any other R. 5 to
    15 points: "Leans toward the target" or "Leans toward the stop". 15 or
-   more: "Strongly toward" one of them. So a 2R plan with target first
-   24.1 % and stop first 50.5 % is close to break-even (it needs 33 % of
-   the 74.6 % that hit a side, and got 32 %), not a loser.
+   more: "Strongly toward" one of them.
 6. **Below the verdict**, when it applies: a line when more than 40 % of the
    replays hit neither (the price at `--until` decides those), and the
    average R when its sign goes against the lean. Those can only point the
@@ -92,50 +107,58 @@ Say the seed with every result so the user can repeat it.
 **5-minute bars only.** Yahoo keeps 60 days of 5-min bars but only about 7
 days of 1-min bars, too few sessions for a fair pool. It refuses, in one
 plain line, when there are fewer than 20 full sessions, when the entry bar is
-not in the data (wrong date, not closed yet, a future day), or when the plan
-does not make sense (a stop above a buy's entry, an entry off the 5-minute
-grid). A live in-progress bar is never used.
+not in the data (wrong date, not closed yet, a future day), when NSE was
+closed on the plan's date (a weekend or a holiday: the 2026 list is typed from
+NSE's and not verified, check nseindia.com; add days under `market_holidays`
+in `trader/config.json`), or when the plan does not make sense (a stop above a
+buy's entry, an entry off the 5-minute grid). A live in-progress bar is never
+used.
 
 ## Steps
 
 1. Make sure `trader/plan.json` is today's plan from `/trader-exit`. If there
    is none, run that first, or pass the plan as flags.
-2. Run `timemachine.py run --write`. Add `--until 15:55` when the plan has a
-   flat-by time, so "neither" means still open at the time you would get out.
+2. Run `timemachine.py run --write`. Add `--until 15:15` when the plan has the
+   default flat-by time, so "neither" means still open at the time you would
+   get out.
 3. Tell the user, in this order: the four odds, the median and the 5 to 95
    range of the price at the close, the average R, the history line, then the
    verdict line and any line under it exactly as printed. Say the seed.
 4. If the verdict is a coin flip or close to break-even, say so plainly. Do
    not dress it up. If the history and the replays disagree, say that too.
 5. Say once that this is built from the last 60 days and is not a prediction.
-   Earnings, news and halts can do things those 60 days never did. Check
+   Results, news and halts can do things those 60 days never did. Check
    `/trader-news` for the stock before going on.
 6. If the user still wants the trade, hand off to `/trader-budget` to size it.
 
-## Example: the reel
+## Example: RELIANCE, 14 October 2026
 
-TSLA, Monday 2026-10-19. The 15-minute opening range is 354.47 to 362.18.
-The 10:10 bar closes above it: entry 364.18 at 10:15 AM (bar 8), stop 358.32
-(the range midpoint, rounded down), target 370.04 (1R, risk 5.86 a share).
+RELIANCE, Wednesday 2026-10-14. The 15-minute opening range is ₹1,162.70 to
+₹1,169.30. The 9:40 bar closes above it: entry ₹1,170.70 at 9:45 AM (bar 5),
+stop ₹1,166.00 (the range midpoint), target ₹1,180.10 (2R, risk ₹4.70 a
+share). The data is RELIANCE's 60 days of 5-minute bars up to 2026-10-29; the
+pool is the 49 full sessions before the 14th.
 
 ```
-10,000 replays of the rest of the session, 10:15 AM to 4:00 PM (69 five-minute bars), seed 19.
-  target first   29.4 %
-  stop first     25.5 %
-  neither        45.1 %   still open at 4:00 PM
-  green          51.7 %   target first, or above the entry at 4:00 PM
-  Price at 4:00 PM: median 364.36, 90 % of replays between 355.54 and 373.54.
-  Average R: +0.034
-History: the same rule on each of those 59 real sessions fired 33 times:
-13 target, 15 stop, 5 neither. Average R -0.062.
-Close to a coin flip: target first 29.4 % vs stop first 25.5 %.
-45.1 % of the replays hit neither by 4:00 PM; the price at 4:00 PM decides those.
+10,000 replays of the rest of the session, 9:45 AM to 3:30 PM (69 five-minute bars), seed 19.
+  target first   23.0 %
+  stop first     65.1 %
+  neither        11.9 %   still open at 3:30 PM
+  green          31.8 %   target first, or above the entry at 3:30 PM
+  Price at 3:30 PM: median ₹1,169.27, 90 % of replays between ₹1,152.82 and ₹1,185.47.
+  Average R: -0.131
+History: the same rule on each of those 49 real sessions fired 23 times:
+6 target, 11 stop, 6 neither. Average R +0.114.
+Leans toward the stop: at 2R the target has to come first in 33 % of the replays that hit one side; it did in 26 % (target first 23.0 % vs stop first 65.1 %).
 ```
 
-At 1R the target has to come first in half of the replays that hit one
-side. It did in 53.6 %. The replays came out close to a coin flip, and the
-real history was slightly worse than even. That is the honest answer for this setup, and it is what
-the user should hear before `/trader-budget` sizes 8 shares.
+At 2R the target has to come first in a third of the replays that hit one
+side. It did in 26 %: the replays lean toward the stop. The real history of the
+same rule was better than the replays (23 trades, a small sample), so the two
+disagree. That is the honest answer for this setup, and it is what the user
+should hear before `/trader-budget` sizes the trade. Note that this stock fell
+over the 60 days in the pool (from about ₹1,307 on 4 August to about ₹1,167 on
+29 October), so its own bars lean down.
 
 ## Rules
 
